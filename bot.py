@@ -53,9 +53,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
 PANEL_URL = os.environ["PANEL_URL"]
 PANEL_PASSWORD = os.environ["PANEL_ADMIN_PASSWORD"]
+
+# Multi-admin: ADMIN_CHAT_ID can be a single id or comma-separated list
+# e.g. "123456789" or "123456789,987654321,111222333"
+_raw_admins = os.environ.get("ADMIN_CHAT_ID", "")
+ADMIN_CHAT_IDS: set[int] = set()
+for part in _raw_admins.replace(" ", "").split(","):
+    part = part.strip()
+    if part:
+        try:
+            ADMIN_CHAT_IDS.add(int(part))
+        except ValueError:
+            logger.warning("Ignoring invalid ADMIN_CHAT_ID entry: %r", part)
+
+if not ADMIN_CHAT_IDS:
+    raise SystemExit(
+        "ADMIN_CHAT_ID is empty or invalid. "
+        "Set it to one or more numeric Telegram chat ids separated by commas."
+    )
 
 panel = PanelClient(PANEL_URL, PANEL_PASSWORD)
 
@@ -85,9 +102,11 @@ PAGE_SIZE = 8
 def admin_only(handler):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id if update.effective_chat else None
-        if chat_id != ADMIN_CHAT_ID:
+        if chat_id not in ADMIN_CHAT_IDS:
             if update.message:
                 await update.message.reply_text("⛔️ این ربات خصوصیه.")
+            elif update.callback_query:
+                await update.callback_query.answer("⛔️ دسترسی نداری.", show_alert=True)
             return ConversationHandler.END
         return await handler(update, context)
 

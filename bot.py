@@ -15,6 +15,7 @@ features (inbounds, worker, server stats, etc).
 
 from __future__ import annotations
 
+import html
 import io
 import logging
 import os
@@ -212,12 +213,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except PanelError as e:
             await query.message.reply_text(f"خطا:\n{e.detail}")
             return
-        text = cfg if isinstance(cfg, str) else str(cfg)
-        # send as a code block, chunked if long
-        for i in range(0, len(text), 3500):
+
+        if isinstance(cfg, dict):
+            config_str = cfg.get("config") or cfg.get("config_url") or str(cfg)
+            sub_url = cfg.get("subscription_url")
+        else:
+            config_str = str(cfg)
+            sub_url = None
+
+        for i in range(0, len(config_str), 3500):
+            chunk = html.escape(config_str[i : i + 3500])
             await query.message.reply_text(
-                f"<code>{text[i:i+3500]}</code>", parse_mode=ParseMode.HTML
+                f"<code>{chunk}</code>", parse_mode=ParseMode.HTML
             )
+
+        if sub_url:
+            await query.message.reply_text(f"🔗 لینک ساب‌اسکریپشن:\n{sub_url}")
         return
 
     if data.startswith("user:qr:"):

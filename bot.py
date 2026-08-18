@@ -33,7 +33,7 @@ from telegram.ext import (
     filters,
 )
 
-from panel_client import PanelClient, PanelError, obj_id, obj_label
+from panel_client import PanelClient, PanelError, extract_config_uris, obj_id, obj_label
 
 load_dotenv()
 
@@ -208,27 +208,53 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("user:config:"):
         user_id = data.split(":", 2)[2]
+
+        # Need the username for /api/sub/{username}; look it up from the
+        # user object (falls back to the raw id if there's no separate
+        # username field).
         try:
-            cfg = await panel.get_user_config(user_id)
+            u = await panel.get_user(user_id)
         except PanelError as e:
             await query.message.reply_text(f"خطا:\n{e.detail}")
             return
+        if isinstance(u, dict) and isinstance(u.get("user"), dict):
+            u = u["user"]
+        username = u.get("username", user_id) if isinstance(u, dict) else user_id
 
-        if isinstance(cfg, dict):
-            config_str = cfg.get("config") or cfg.get("config_url") or str(cfg)
-            sub_url = cfg.get("subscription_url")
-        else:
-            config_str = str(cfg)
-            sub_url = None
+        configs: list[str] = []
+        try:
+            sub_data = await panel.get_sub_data(username)
+            configs = extract_config_uris(sub_data)
+        except PanelError:
+            pass  # fall back to the single-config endpoint below
 
-        for i in range(0, len(config_str), 3500):
-            chunk = html.escape(config_str[i : i + 3500])
+        if not configs:
+            try:
+                cfg = await panel.get_user_config(user_id)
+                configs = extract_config_uris(cfg)
+            except PanelError as e:
+                await query.message.reply_text(f"خطا در گرفتن کانفیگ:\n{e.detail}")
+                return
+
+        if not configs:
+            await query.message.reply_text("هیچ کانفیگی برای این کاربر پیدا نشد.")
+            return
+
+        await query.message.reply_text(f"📄 {len(configs)} کانفیگ پیدا شد:")
+        for idx, uri in enumerate(configs, start=1):
+            escaped = html.escape(uri)
             await query.message.reply_text(
-                f"<code>{chunk}</code>", parse_mode=ParseMode.HTML
+                f"<b>{idx}.</b>\n<code>{escaped}</code>", parse_mode=ParseMode.HTML
             )
 
-        if sub_url:
-            await query.message.reply_text(f"🔗 لینک ساب‌اسکریپشن:\n{sub_url}")
+        sub_url = panel.sub_page_url(username)
+        await query.message.reply_text(
+            "🔗 لینک صفحه‌ی ساب (برای دیدن/کپی از مرورگر):\n"
+            f"{sub_url}\n\n"
+            "⚠️ این لینک یه صفحه‌ی وب‌ـه، نه فرمت subscription خام — "
+            "توی v2rayN معمولاً به‌عنوان «Subscribe URL» اضافه‌ش کنی جواب نمی‌ده. "
+            "برای وارد کردن توی کلاینت، همون کانفیگ‌های بالا رو تک‌تک با «Import from clipboard» اضافه کن."
+        )
         return
 
     if data.startswith("user:qr:"):

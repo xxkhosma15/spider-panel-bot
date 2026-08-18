@@ -65,6 +65,44 @@ def obj_label(obj, *keys, default=None):
     return str(obj)
 
 
+_CONFIG_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "ssr://")
+
+
+def extract_config_uris(obj) -> list[str]:
+    """
+    Recursively walk any JSON-decoded structure (dict/list/str) and
+    collect every string that looks like a proxy config URI
+    (vless://, vmess://, trojan://, ss://...). This makes config
+    extraction robust to whatever shape a given panel fork wraps its
+    configs in (a "configs" list, a "custom_configs" list, a nested
+    "status" object, etc.) — we don't need to know the exact schema,
+    just recognize the URIs themselves. Order is preserved and
+    duplicates are dropped.
+    """
+    found: list[str] = []
+
+    def walk(node):
+        if isinstance(node, str):
+            if node.startswith(_CONFIG_SCHEMES):
+                found.append(node)
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(obj)
+
+    seen = set()
+    unique = []
+    for uri in found:
+        if uri not in seen:
+            seen.add(uri)
+            unique.append(uri)
+    return unique
+
+
 class PanelClient:
     def __init__(self, base_url: str, admin_password: str, timeout: float = 20.0):
         self.base_url = base_url.rstrip("/")
@@ -128,9 +166,19 @@ class PanelClient:
         r = await self._request("GET", f"/api/users/{user_id}/qr")
         return r.content
 
-    async def get_sub_link_path(self, identifier: str) -> str:
-        """Returns the relative subscription page path for a user."""
-        return f"/sub/{identifier}"
+    async def get_sub_data(self, identifier: str) -> dict:
+        """
+        GET /api/sub/{username} — the panel's own data source for the
+        per-user subscription page. Returns everything needed to build
+        the sub page: main configs, custom-IP configs, status config,
+        etc. This is the endpoint to use to get *all* of a user's
+        configs (a single /api/users/{id}/config call only returns one).
+        """
+        r = await self._request("GET", f"/api/sub/{identifier}")
+        return r.json()
+
+    def sub_page_url(self, identifier: str) -> str:
+        return f"{self.base_url}/sub/{identifier}"
 
     # ---- inbounds -----------------------------------------------------
 

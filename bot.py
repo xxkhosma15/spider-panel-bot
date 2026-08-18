@@ -1,242 +1,1420 @@
 """
-Thin async client for the Spider Panel API.
+Admin-only Telegram bot for Spider Panel — expanded version.
 
-Covers the main documented endpoints:
-  - Auth (login / change password)
-  - Users (CRUD, toggle, reset traffic, config, QR, sub)
-  - Inbounds (list, create, update, delete, generate keys)
-  - Groups
-  - Scanner (saved IPs)
-  - Cloudflare Worker
-  - Server stats
+Covers:
+  • Users (list / create / view / config / QR / delete / toggle / reset traffic)
+  • Inbounds (list / create quick / delete / generate Reality keys)
+  • Server stats
+  • Cloudflare Worker (status / sync / sync-source)
+  • Scanner (view saved CF & Railway IPs)
+  • Groups (list / create / delete)
+  • Change panel password
+
+Setup:
+  1. pip install -r requirements.txt
+  2. cp .env.example .env  → fill values
+  3. python bot.py
 """
 
 from __future__ import annotations
 
-import httpx
+import html
+import io
+import logging
+import os
+
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+from panel_client import (
+    PanelClient,
+    PanelError,
+    extract_config_uris,
+    obj_id,
+    obj_label,
+)
+
+load_dotenv()
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+PANEL_URL = os.environ["PANEL_URL"]
+PANEL_PASSWORD = os.environ["PANEL_ADMIN_PASSWORD"]
+
+# Multi-admin: ADMIN_CHAT_ID can be a single id or comma-separated list
+# e.g. "123456789" or "123456789,987654321,111222333"
+_raw_admins = os.environ.get("ADMIN_CHAT_ID", "")
+ADMIN_CHAT_IDS: set[int] = set()
+for part in _raw_admins.replace(" ", "").split(","):
+    part = part.strip()
+    if part:
+        try:
+            ADMIN_CHAT_IDS.add(int(part))
+        except ValueError:
+            logger.warning("Ignoring invalid ADMIN_CHAT_ID entry: %r", part)
+
+if not ADMIN_CHAT_IDS:
+    raise SystemExit(
+        "ADMIN_CHAT_ID is empty or invalid. "
+        "Set it to one or more numeric Telegram chat ids separated by commas."
+    )
+
+panel = PanelClient(PANEL_URL, PANEL_PASSWORD)
+
+# Conversation states
+(
+    ASK_USERNAME,
+    ASK_INBOUNDS,
+    ASK_LIMIT,
+    ASK_EXPIRE,
+    ASK_CONCURRENT,
+    CONFIRM_CREATE,
+    # inbound create
+    ASK_IB_NAME,
+    ASK_IB_PROTO,
+    # group create
+    ASK_GRP_NAME,
+    # change password
+    ASK_OLD_PASS,
+    ASK_NEW_PASS,
+    # edit user fields
+    EDIT_USERNAME,
+    EDIT_TRAFFIC,
+    EDIT_EXPIRE,
+    EDIT_CONCURRENT,
+) = range(15)
+
+PAGE_SIZE = 8
 
 
-class PanelError(Exception):
-    def __init__(self, status_code: int, detail: str):
-        self.status_code = status_code
-        self.detail = detail
-        super().__init__(f"Panel API error {status_code}: {detail}")
+# ── access control ──────────────────────────────────────────────────────────
 
 
-def normalize_list(data) -> list:
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("users", "inbounds", "groups", "items", "data", "results", "list"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-        return list(data.values())
-    return []
+def admin_only(handler):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        if chat_id not in ADMIN_CHAT_IDS:
+            if update.message:
+                await update.message.reply_text("⛔️ این ربات خصوصیه.")
+            elif update.callback_query:
+                await update.callback_query.answer("⛔️ دسترسی نداری.", show_alert=True)
+            return ConversationHandler.END
+        return await handler(update, context)
+
+    return wrapped
 
 
-def obj_id(obj, *keys):
-    if isinstance(obj, dict):
-        for k in keys:
-            if k in obj and obj[k] is not None:
-                return obj[k]
-        return None
-    return obj
+# ── main menu ───────────────────────────────────────────────────────────────
 
 
-def obj_label(obj, *keys, default=None):
-    if isinstance(obj, dict):
-        for k in keys:
-            if k in obj and obj[k] not in (None, ""):
-                return str(obj[k])
-        return default if default is not None else str(obj)
-    return str(obj)
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("👥 کاربران", callback_data="menu:users")],
+            [InlineKeyboardButton("📥 اینباندها", callback_data="menu:inbounds")],
+            [InlineKeyboardButton("📊 آمار سرور", callback_data="stats:show")],
+            [InlineKeyboardButton("☁️ Worker", callback_data="menu:worker")],
+            [InlineKeyboardButton("🔍 اسکنر IP", callback_data="menu:scanner")],
+            [InlineKeyboardButton("📁 گروه‌ها", callback_data="menu:groups")],
+            [InlineKeyboardButton("⚙️ تغییر پسورد پنل", callback_data="settings:pass")],
+        ]
+    )
 
 
-_CONFIG_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "ssr://")
+@admin_only
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "به ربات مدیریت <b>Spider Panel</b> خوش اومدی 🕷️\nیکی از گزینه‌ها رو انتخاب کن:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
+    )
 
 
-def extract_config_uris(obj) -> list[str]:
-    found: list[str] = []
-
-    def walk(node):
-        if isinstance(node, str):
-            if node.startswith(_CONFIG_SCHEMES):
-                found.append(node)
-        elif isinstance(node, dict):
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(obj)
-    seen = set()
-    unique = []
-    for uri in found:
-        if uri not in seen:
-            seen.add(uri)
-            unique.append(uri)
-    return unique
+async def show_main_menu(query):
+    await query.edit_message_text(
+        "یکی از گزینه‌ها رو انتخاب کن:",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
-class PanelClient:
-    def __init__(self, base_url: str, admin_password: str, timeout: float = 25.0):
-        self.base_url = base_url.rstrip("/")
-        self.admin_password = admin_password
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
-        self._logged_in = False
+# ── users ───────────────────────────────────────────────────────────────────
 
-    async def close(self):
-        await self._client.aclose()
 
-    # ---- auth -----------------------------------------------------
+def users_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 لیست کاربران", callback_data="users:list:0")],
+            [InlineKeyboardButton("➕ ساخت کاربر جدید", callback_data="user:new")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="menu:main")],
+        ]
+    )
 
-    async def login(self):
-        r = await self._client.post("/api/login", json={"password": self.admin_password})
-        if r.status_code >= 400:
-            raise PanelError(r.status_code, r.text)
-        self._logged_in = True
 
-    async def change_password(self, current: str, new: str) -> dict:
-        r = await self._request(
-            "POST",
-            "/api/change-password",
-            json={"current_password": current, "new_password": new},
+async def render_user_list(query, page: int):
+    try:
+        users = await panel.list_users()
+    except PanelError as e:
+        await query.edit_message_text(f"خطا در گرفتن لیست کاربران:\n{e.detail}")
+        return
+
+    if not users:
+        await query.edit_message_text(
+            "هیچ کاربری هنوز ثبت نشده.", reply_markup=users_menu_keyboard()
         )
-        return r.json()
+        return
 
-    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        if not self._logged_in:
-            await self.login()
-        r = await self._client.request(method, path, **kwargs)
-        if r.status_code == 401:
-            await self.login()
-            r = await self._client.request(method, path, **kwargs)
-        if r.status_code >= 400:
-            raise PanelError(r.status_code, r.text)
-        return r
+    start = page * PAGE_SIZE
+    chunk = users[start : start + PAGE_SIZE]
 
-    # ---- users ----------------------------------------------------
+    buttons = []
+    for u in chunk:
+        uid = obj_id(u, "id", "user_id", "_id", "uuid", "username")
+        label = obj_label(u, "username", "name", "id", default=str(uid))
+        status = u.get("status", "active") if isinstance(u, dict) else "active"
+        mark = "🟢" if status == "active" else "🔴"
+        buttons.append(
+            [InlineKeyboardButton(f"{mark} {label}", callback_data=f"user:view:{uid}")]
+        )
 
-    async def list_users(self) -> list:
-        r = await self._request("GET", "/api/users")
-        return normalize_list(r.json())
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"users:list:{page-1}"))
+    if start + PAGE_SIZE < len(users):
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"users:list:{page+1}"))
+    if nav:
+        buttons.append(nav)
 
-    async def get_user(self, user_id) -> dict:
-        r = await self._request("GET", f"/api/users/{user_id}")
-        return r.json()
+    buttons.append([InlineKeyboardButton("🏠 منوی کاربران", callback_data="menu:users")])
+    await query.edit_message_text(
+        f"👥 کاربران ({len(users)} نفر) — صفحه {page + 1}",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
-    async def create_user(self, payload: dict) -> dict:
-        r = await self._request("POST", "/api/users", json=payload)
-        return r.json()
 
-    async def update_user(self, user_id, payload: dict) -> dict:
-        r = await self._request("PATCH", f"/api/users/{user_id}", json=payload)
-        return r.json()
+def user_detail_keyboard(user_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📄 کانفیگ", callback_data=f"user:config:{user_id}"),
+                InlineKeyboardButton("🔳 QR", callback_data=f"user:qr:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("✏️ تغییر اسم", callback_data=f"user:edit_name:{user_id}"),
+                InlineKeyboardButton("📦 ویرایش حجم", callback_data=f"user:edit_traffic:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("⏳ ویرایش زمان", callback_data=f"user:edit_expire:{user_id}"),
+                InlineKeyboardButton("🔗 تعداد اتصال", callback_data=f"user:edit_concurrent:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("🔄 فعال/غیرفعال", callback_data=f"user:toggle:{user_id}"),
+                InlineKeyboardButton("♻️ ریست ترافیک", callback_data=f"user:reset:{user_id}"),
+            ],
+            [InlineKeyboardButton("🗑 حذف", callback_data=f"user:delete_confirm:{user_id}")],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="users:list:0")],
+        ]
+    )
 
-    async def toggle_user(self, user_id) -> dict:
-        r = await self._request("PATCH", f"/api/users/{user_id}/toggle")
-        return r.json()
 
-    async def reset_user_traffic(self, user_id) -> dict:
-        r = await self._request("PATCH", f"/api/users/{user_id}/reset")
-        return r.json()
+async def render_user_detail(query, user_id):
+    try:
+        u = await panel.get_user(user_id)
+    except PanelError as e:
+        await query.edit_message_text(f"خطا:\n{e.detail}")
+        return
 
-    async def delete_user(self, user_id) -> None:
-        await self._request("DELETE", f"/api/users/{user_id}")
+    if isinstance(u, dict) and isinstance(u.get("user"), dict):
+        u = u["user"]
+    if not isinstance(u, dict):
+        u = {}
 
-    async def get_user_config(self, user_id) -> dict:
-        r = await self._request("GET", f"/api/users/{user_id}/config")
-        return r.json()
+    username = u.get("username", user_id)
+    status = u.get("status", "active")
+    status_icon = "🟢 فعال" if status == "active" else "🔴 غیرفعال"
 
-    async def get_user_qr(self, user_id) -> bytes:
-        r = await self._request("GET", f"/api/users/{user_id}/qr")
-        return r.content
+    used = u.get("traffic_used_bytes") or u.get("used_bytes") or 0
+    limit = u.get("traffic_limit_bytes") or u.get("limit_bytes") or 0
+    try:
+        used_gb = round(int(used) / (1024**3), 2)
+        limit_gb = round(int(limit) / (1024**3), 2) if limit else "∞"
+    except Exception:
+        used_gb, limit_gb = "?", "?"
 
-    async def get_sub_data(self, identifier: str) -> dict:
-        r = await self._request("GET", f"/api/sub/{identifier}")
-        return r.json()
+    concurrent = u.get("concurrent_connections")
+    lines = [
+        f"👤 <b>{html.escape(str(username))}</b>",
+        f"• وضعیت: {status_icon}",
+        f"• ترافیک: {used_gb} / {limit_gb} GB",
+    ]
+    if concurrent is not None:
+        lines.append(f"• اتصال همزمان: {concurrent}")
+    for key in ("expire_at", "expire", "proxy_ip_enabled", "proxy_country", "custom_ip_type"):
+        if key in u and u[key] not in (None, "", False):
+            lines.append(f"• {key}: {html.escape(str(u[key]))}")
 
-    def sub_page_url(self, identifier: str) -> str:
-        return f"{self.base_url}/sub/{identifier}"
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=user_detail_keyboard(user_id),
+    )
 
-    # ---- inbounds -------------------------------------------------
 
-    async def list_inbounds(self) -> list:
-        r = await self._request("GET", "/api/inbounds")
-        return normalize_list(r.json())
+# ── inbounds ────────────────────────────────────────────────────────────────
 
-    async def create_inbound(self, payload: dict) -> dict:
-        r = await self._request("POST", "/api/inbounds", json=payload)
-        return r.json()
 
-    async def update_inbound(self, inbound_id, payload: dict) -> dict:
-        r = await self._request("PATCH", f"/api/inbounds/{inbound_id}", json=payload)
-        return r.json()
+def inbounds_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 لیست اینباندها", callback_data="inbounds:list")],
+            [InlineKeyboardButton("➕ ساخت اینباند سریع", callback_data="inbound:new")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="menu:main")],
+        ]
+    )
 
-    async def delete_inbound(self, inbound_id) -> None:
-        await self._request("DELETE", f"/api/inbounds/{inbound_id}")
 
-    async def generate_reality_keys(self, inbound_id) -> dict:
-        r = await self._request("POST", f"/api/inbounds/{inbound_id}/generate-reality-keys")
-        return r.json()
+async def render_inbound_list(query):
+    try:
+        inbounds = await panel.list_inbounds()
+    except PanelError as e:
+        await query.edit_message_text(f"خطا:\n{e.detail}")
+        return
 
-    async def generate_short_id(self, inbound_id) -> dict:
-        r = await self._request("POST", f"/api/inbounds/{inbound_id}/generate-short-id")
-        return r.json()
+    if not inbounds:
+        await query.edit_message_text(
+            "هیچ اینباندی تعریف نشده.", reply_markup=inbounds_menu_keyboard()
+        )
+        return
 
-    # ---- groups ---------------------------------------------------
+    buttons = []
+    for ib in inbounds:
+        ib_id = obj_id(ib, "id", "inbound_id", "_id")
+        name = obj_label(ib, "name", "remark", "tag", default=str(ib_id))
+        proto = (ib.get("protocol") or "?") if isinstance(ib, dict) else "?"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{name} ({proto})",
+                    callback_data=f"inbound:view:{ib_id}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("🏠 منوی اینباندها", callback_data="menu:inbounds")])
+    await query.edit_message_text(
+        f"📥 اینباندها ({len(inbounds)})",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
-    async def list_groups(self) -> list:
-        r = await self._request("GET", "/api/groups")
-        return normalize_list(r.json())
 
-    async def create_group(self, payload: dict) -> dict:
-        r = await self._request("POST", "/api/groups", json=payload)
-        return r.json()
+def inbound_detail_keyboard(inbound_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔑 تولید کلید Reality",
+                    callback_data=f"inbound:genkeys:{inbound_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🆔 Short ID جدید",
+                    callback_data=f"inbound:gensid:{inbound_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗑 حذف اینباند",
+                    callback_data=f"inbound:delete_confirm:{inbound_id}",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="inbounds:list")],
+        ]
+    )
 
-    async def update_group(self, group_id, payload: dict) -> dict:
-        r = await self._request("PATCH", f"/api/groups/{group_id}", json=payload)
-        return r.json()
 
-    async def delete_group(self, group_id) -> None:
-        await self._request("DELETE", f"/api/groups/{group_id}")
+async def render_inbound_detail(query, inbound_id):
+    try:
+        inbounds = await panel.list_inbounds()
+    except PanelError as e:
+        await query.edit_message_text(f"خطا:\n{e.detail}")
+        return
 
-    # ---- scanner --------------------------------------------------
+    ib = None
+    for item in inbounds:
+        if str(obj_id(item, "id", "inbound_id", "_id")) == str(inbound_id):
+            ib = item
+            break
 
-    async def scanner_ips(self, ctype: str) -> dict:
-        r = await self._request("GET", f"/api/scanner/ips/{ctype}")
-        return r.json()
+    if not ib or not isinstance(ib, dict):
+        await query.edit_message_text("اینباند پیدا نشد.", reply_markup=inbounds_menu_keyboard())
+        return
 
-    async def scanner_resolve(self, host: str) -> dict:
-        r = await self._request("GET", "/api/scanner/resolve", params={"host": host})
-        return r.json()
+    name = ib.get("name") or inbound_id
+    lines = [
+        f"📥 <b>{html.escape(str(name))}</b>",
+        f"• protocol: {ib.get('protocol', '?')}",
+        f"• network: {ib.get('network', '?')}",
+        f"• security: {ib.get('security', '?')}",
+        f"• port: {ib.get('port', '?')}",
+    ]
+    if ib.get("domain"):
+        lines.append(f"• domain: {html.escape(str(ib['domain']))}")
+    if ib.get("sni"):
+        lines.append(f"• sni: {html.escape(str(ib['sni']))}")
 
-    # ---- worker ---------------------------------------------------
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=inbound_detail_keyboard(inbound_id),
+    )
 
-    async def worker_status(self) -> dict:
-        r = await self._request("GET", "/api/worker")
-        return r.json()
 
-    async def worker_sync(self) -> dict:
-        r = await self._request("POST", "/api/worker/sync")
-        return r.json()
+# ── groups ──────────────────────────────────────────────────────────────────
 
-    async def worker_sync_source(self) -> dict:
-        r = await self._request("POST", "/api/worker/sync-source")
-        return r.json()
 
-    async def worker_locations(self) -> dict:
-        r = await self._request("GET", "/api/worker/locations")
-        return r.json()
+def groups_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="groups:list")],
+            [InlineKeyboardButton("➕ ساخت گروه", callback_data="group:new")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="menu:main")],
+        ]
+    )
 
-    async def worker_disconnect(self) -> dict:
-        r = await self._request("DELETE", "/api/worker")
-        return r.json()
 
-    # ---- server ---------------------------------------------------
+async def render_group_list(query):
+    try:
+        groups = await panel.list_groups()
+    except PanelError as e:
+        await query.edit_message_text(f"خطا:\n{e.detail}")
+        return
 
-    async def server_stats(self) -> dict:
-        r = await self._request("GET", "/api/server/stats")
-        return r.json()
+    if not groups:
+        await query.edit_message_text(
+            "هیچ گروهی وجود ندارد.", reply_markup=groups_menu_keyboard()
+        )
+        return
+
+    buttons = []
+    for g in groups:
+        gid = obj_id(g, "group_id", "id", "_id")
+        name = obj_label(g, "name", default=str(gid))
+        count = g.get("user_count", len(g.get("user_ids") or [])) if isinstance(g, dict) else 0
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{name} ({count} نفر)",
+                    callback_data=f"group:view:{gid}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("🏠 منوی گروه‌ها", callback_data="menu:groups")])
+    await query.edit_message_text(
+        f"📁 گروه‌ها ({len(groups)})",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+def group_detail_keyboard(group_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🗑 حذف گروه",
+                    callback_data=f"group:delete_confirm:{group_id}",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="groups:list")],
+        ]
+    )
+
+
+# ── scanner ─────────────────────────────────────────────────────────────────
+
+
+def scanner_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("☁️ Cloudflare IPs", callback_data="scanner:cf")],
+            [InlineKeyboardButton("🚂 Railway IPs", callback_data="scanner:railway")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="menu:main")],
+        ]
+    )
+
+
+# ── worker ──────────────────────────────────────────────────────────────────
+
+
+def worker_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📡 وضعیت Worker", callback_data="worker:status")],
+            [InlineKeyboardButton("🔄 Sync کاربران", callback_data="worker:sync")],
+            [InlineKeyboardButton("🌍 Sync Source پروکسی‌ها", callback_data="worker:syncsrc")],
+            [InlineKeyboardButton("📍 لوکیشن‌ها", callback_data="worker:locations")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="menu:main")],
+        ]
+    )
+
+
+# ── callback router ─────────────────────────────────────────────────────────
+
+
+@admin_only
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    # ── menus ──
+    if data == "menu:main":
+        await show_main_menu(query)
+        return
+    if data == "menu:users":
+        await query.edit_message_text("بخش کاربران:", reply_markup=users_menu_keyboard())
+        return
+    if data == "menu:inbounds":
+        await query.edit_message_text("بخش اینباندها:", reply_markup=inbounds_menu_keyboard())
+        return
+    if data == "menu:groups":
+        await query.edit_message_text("بخش گروه‌ها:", reply_markup=groups_menu_keyboard())
+        return
+    if data == "menu:scanner":
+        await query.edit_message_text(
+            "اسکنر IP (فقط مشاهده لیست ذخیره‌شده):\n"
+            "اسکن واقعی از مرورگر پنل انجام می‌شود.",
+            reply_markup=scanner_menu_keyboard(),
+        )
+        return
+    if data == "menu:worker":
+        await query.edit_message_text("Cloudflare Worker:", reply_markup=worker_menu_keyboard())
+        return
+
+    # ── users ──
+    if data.startswith("users:list:"):
+        page = int(data.split(":")[2])
+        await render_user_list(query, page)
+        return
+
+    if data.startswith("user:view:"):
+        await render_user_detail(query, data.split(":", 2)[2])
+        return
+
+    if data.startswith("user:config:"):
+        user_id = data.split(":", 2)[2]
+        try:
+            u = await panel.get_user(user_id)
+        except PanelError as e:
+            await query.message.reply_text(f"خطا:\n{e.detail}")
+            return
+        if isinstance(u, dict) and isinstance(u.get("user"), dict):
+            u = u["user"]
+        username = u.get("username", user_id) if isinstance(u, dict) else user_id
+
+        configs: list[str] = []
+        try:
+            sub_data = await panel.get_sub_data(username)
+            configs = extract_config_uris(sub_data)
+        except PanelError:
+            pass
+        if not configs:
+            try:
+                cfg = await panel.get_user_config(user_id)
+                configs = extract_config_uris(cfg)
+            except PanelError as e:
+                await query.message.reply_text(f"خطا در گرفتن کانفیگ:\n{e.detail}")
+                return
+        if not configs:
+            await query.message.reply_text("هیچ کانفیگی پیدا نشد.")
+            return
+
+        await query.message.reply_text(f"📄 {len(configs)} کانفیگ پیدا شد:")
+        for idx, uri in enumerate(configs, start=1):
+            await query.message.reply_text(
+                f"<b>{idx}.</b>\n<code>{html.escape(uri)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        sub_url = panel.sub_page_url(username)
+        await query.message.reply_text(
+            f"🔗 صفحه ساب:\n{sub_url}\n\n"
+            "⚠️ این لینک صفحه وب است، نه subscription خام."
+        )
+        return
+
+    if data.startswith("user:qr:"):
+        user_id = data.split(":", 2)[2]
+        try:
+            qr_bytes = await panel.get_user_qr(user_id)
+        except PanelError as e:
+            await query.message.reply_text(f"خطا:\n{e.detail}")
+            return
+        await query.message.reply_photo(photo=io.BytesIO(qr_bytes))
+        return
+
+    if data.startswith("user:toggle:"):
+        user_id = data.split(":", 2)[2]
+        try:
+            res = await panel.toggle_user(user_id)
+            status = res.get("status", "?")
+            await query.answer(f"وضعیت → {status}", show_alert=True)
+            await render_user_detail(query, user_id)
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+        return
+
+    if data.startswith("user:reset:"):
+        user_id = data.split(":", 2)[2]
+        try:
+            await panel.reset_user_traffic(user_id)
+            await query.answer("ترافیک ریست شد ✅", show_alert=True)
+            await render_user_detail(query, user_id)
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+        return
+
+    if data.startswith("user:delete_confirm:"):
+        user_id = data.split(":", 2)[2]
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"user:delete:{user_id}"),
+                    InlineKeyboardButton("❌ انصراف", callback_data=f"user:view:{user_id}"),
+                ]
+            ]
+        )
+        await query.edit_message_text("مطمئنی می‌خوای این کاربر رو حذف کنی؟", reply_markup=kb)
+        return
+
+    if data.startswith("user:delete:"):
+        user_id = data.split(":", 2)[2]
+        try:
+            await panel.delete_user(user_id)
+        except PanelError as e:
+            await query.edit_message_text(f"خطا در حذف:\n{e.detail}")
+            return
+        await query.edit_message_text("✅ کاربر حذف شد.", reply_markup=users_menu_keyboard())
+        return
+
+    # ── inbounds ──
+    if data == "inbounds:list":
+        await render_inbound_list(query)
+        return
+
+    if data.startswith("inbound:view:"):
+        await render_inbound_detail(query, data.split(":", 2)[2])
+        return
+
+    if data.startswith("inbound:genkeys:"):
+        inbound_id = data.split(":", 2)[2]
+        try:
+            res = await panel.generate_reality_keys(inbound_id)
+            await query.answer("کلیدهای Reality جدید ساخته شد ✅", show_alert=True)
+            await render_inbound_detail(query, inbound_id)
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+        return
+
+    if data.startswith("inbound:gensid:"):
+        inbound_id = data.split(":", 2)[2]
+        try:
+            await panel.generate_short_id(inbound_id)
+            await query.answer("Short ID جدید ساخته شد ✅", show_alert=True)
+            await render_inbound_detail(query, inbound_id)
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+        return
+
+    if data.startswith("inbound:delete_confirm:"):
+        inbound_id = data.split(":", 2)[2]
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ حذف", callback_data=f"inbound:delete:{inbound_id}"),
+                    InlineKeyboardButton("❌ انصراف", callback_data=f"inbound:view:{inbound_id}"),
+                ]
+            ]
+        )
+        await query.edit_message_text("اینباند حذف بشه؟", reply_markup=kb)
+        return
+
+    if data.startswith("inbound:delete:"):
+        inbound_id = data.split(":", 2)[2]
+        try:
+            await panel.delete_inbound(inbound_id)
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+            return
+        await query.edit_message_text("✅ اینباند حذف شد.", reply_markup=inbounds_menu_keyboard())
+        return
+
+    # ── groups ──
+    if data == "groups:list":
+        await render_group_list(query)
+        return
+
+    if data.startswith("group:view:"):
+        gid = data.split(":", 2)[2]
+        try:
+            groups = await panel.list_groups()
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+            return
+        g = next(
+            (x for x in groups if str(obj_id(x, "group_id", "id")) == str(gid)),
+            None,
+        )
+        if not g:
+            await query.edit_message_text("گروه پیدا نشد.")
+            return
+        name = g.get("name", gid)
+        count = g.get("user_count", len(g.get("user_ids") or []))
+        text = (
+            f"📁 <b>{html.escape(str(name))}</b>\n"
+            f"• تعداد کاربران: {count}\n"
+            f"• ترافیک: {g.get('traffic_limit', 0)}\n"
+            f"• روز اعتبار: {g.get('expire_days', 0)}"
+        )
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=group_detail_keyboard(gid)
+        )
+        return
+
+    if data.startswith("group:delete_confirm:"):
+        gid = data.split(":", 2)[2]
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ حذف", callback_data=f"group:delete:{gid}"),
+                    InlineKeyboardButton("❌ انصراف", callback_data=f"group:view:{gid}"),
+                ]
+            ]
+        )
+        await query.edit_message_text("گروه حذف بشه؟", reply_markup=kb)
+        return
+
+    if data.startswith("group:delete:"):
+        gid = data.split(":", 2)[2]
+        try:
+            await panel.delete_group(gid)
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+            return
+        await query.edit_message_text("✅ گروه حذف شد.", reply_markup=groups_menu_keyboard())
+        return
+
+    # ── scanner ──
+    if data.startswith("scanner:"):
+        ctype = data.split(":", 1)[1]
+        if ctype not in ("cf", "railway"):
+            return
+        try:
+            res = await panel.scanner_ips(ctype)
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+            return
+        ips = res.get("ips") or []
+        if not ips:
+            text = f"هیچ IP ذخیره‌شده‌ای برای <b>{ctype}</b> نیست."
+        else:
+            lines = [f"🔍 IPs ({ctype}) — {len(ips)} مورد:"]
+            for ip in ips:
+                lines.append(f"• <code>{html.escape(str(ip))}</code>")
+            text = "\n".join(lines)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=scanner_menu_keyboard()
+        )
+        return
+
+    # ── worker ──
+    if data == "worker:status":
+        try:
+            res = await panel.worker_status()
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+            return
+        connected = res.get("connected") or res.get("ok")
+        domain = res.get("worker_domain") or res.get("domain") or "—"
+        name = res.get("worker_name") or "—"
+        text = (
+            f"☁️ <b>Worker Status</b>\n"
+            f"• متصل: {'✅ بله' if connected else '❌ خیر'}\n"
+            f"• نام: {html.escape(str(name))}\n"
+            f"• دامنه: <code>{html.escape(str(domain))}</code>"
+        )
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=worker_menu_keyboard()
+        )
+        return
+
+    if data == "worker:sync":
+        try:
+            await panel.worker_sync()
+            await query.answer("Sync انجام شد ✅", show_alert=True)
+        except PanelError as e:
+            await query.answer(f"خطا: {e.detail[:100]}", show_alert=True)
+        return
+
+    if data == "worker:syncsrc":
+        try:
+            await panel.worker_sync_source()
+            await query.answer("Source پروکسی‌ها آپدیت شد ✅", show_alert=True)
+        except PanelError as e:
+            await query.answer(f"خطا: {e.detail[:100]}", show_alert=True)
+        return
+
+    if data == "worker:locations":
+        try:
+            res = await panel.worker_locations()
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+            return
+        # response shape may vary
+        locs = res.get("locations") or res.get("proxies") or res
+        if isinstance(locs, dict):
+            lines = ["📍 لوکیشن‌های Worker:"]
+            for code, val in list(locs.items())[:30]:
+                lines.append(f"• <code>{html.escape(str(code))}</code>: {html.escape(str(val)[:60])}")
+            text = "\n".join(lines) if len(lines) > 1 else "لوکیشنی پیدا نشد."
+        else:
+            text = f"<pre>{html.escape(str(locs)[:1500])}</pre>"
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=worker_menu_keyboard()
+        )
+        return
+
+    # ── stats ──
+    if data == "stats:show":
+        try:
+            s = await panel.server_stats()
+        except PanelError as e:
+            await query.edit_message_text(f"خطا:\n{e.detail}")
+            return
+        # flexible formatting
+        def g(*keys, default="—"):
+            for k in keys:
+                if k in s and s[k] is not None:
+                    return s[k]
+            return default
+
+        text = (
+            "📊 <b>آمار سرور</b>\n"
+            f"• CPU: {g('cpu', 'cpu_percent')}%\n"
+            f"• RAM: {g('ram', 'memory', 'mem_percent')}%\n"
+            f"• Disk: {g('disk', 'disk_percent')}%\n"
+            f"• Uptime: {g('uptime', 'uptime_sec')}\n"
+            f"• Connections: {g('connections', 'active_connections')}\n"
+        )
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
+        )
+        return
+
+
+# ── create user conversation ────────────────────────────────────────────────
+
+
+@admin_only
+async def new_user_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_user"] = {}
+    await query.edit_message_text("نام کاربری جدید رو بفرست:")
+    return ASK_USERNAME
+
+
+async def new_user_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_user"]["username"] = update.message.text.strip()
+    try:
+        inbounds = await panel.list_inbounds()
+    except PanelError as e:
+        await update.message.reply_text(f"خطا در گرفتن اینباندها:\n{e.detail}")
+        return ConversationHandler.END
+
+    if not inbounds:
+        await update.message.reply_text(
+            "هیچ اینباندی توی پنل تعریف نشده. اول از پنل یا بخش اینباندها یه اینباند بساز."
+        )
+        return ConversationHandler.END
+
+    choices = {}
+    for ib in inbounds:
+        ib_id = obj_id(ib, "id", "inbound_id", "_id", "tag", "remark")
+        label = obj_label(ib, "name", "remark", "tag", "id", default=str(ib_id))
+        choices[str(ib_id)] = label
+    context.user_data["new_user"]["_inbound_choices"] = choices
+    context.user_data["new_user"]["inbound_ids"] = []
+
+    await update.message.reply_text(
+        "اینباند(ها) رو انتخاب کن (چندتا هم میشه)، بعد «تایید» رو بزن:",
+        reply_markup=inbound_choice_keyboard(context),
+    )
+    return ASK_INBOUNDS
+
+
+def inbound_choice_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    data = context.user_data["new_user"]
+    selected = set(data["inbound_ids"])
+    rows = []
+    for ib_id, label in data["_inbound_choices"].items():
+        mark = "✅ " if ib_id in selected else ""
+        rows.append(
+            [InlineKeyboardButton(f"{mark}{label}", callback_data=f"inbound_toggle:{ib_id}")]
+        )
+    rows.append([InlineKeyboardButton("تایید ➡️", callback_data="inbound_done")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def toggle_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ib_id = query.data.split(":", 1)[1]
+    ids = context.user_data["new_user"]["inbound_ids"]
+    if ib_id in ids:
+        ids.remove(ib_id)
+    else:
+        ids.append(ib_id)
+    await query.edit_message_reply_markup(reply_markup=inbound_choice_keyboard(context))
+    return ASK_INBOUNDS
+
+
+async def inbound_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not context.user_data["new_user"]["inbound_ids"]:
+        await query.answer("حداقل یه اینباند انتخاب کن", show_alert=True)
+        return ASK_INBOUNDS
+    await query.edit_message_text("سقف ترافیک به گیگابایت رو بفرست (فقط عدد، برای نامحدود 0):")
+    return ASK_LIMIT
+
+
+async def new_user_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.replace(".", "", 1).isdigit():
+        await update.message.reply_text("لطفاً فقط عدد بفرست (مثلاً 30 یا 0 برای نامحدود).")
+        return ASK_LIMIT
+    context.user_data["new_user"]["traffic_limit_gb"] = float(text)
+    await update.message.reply_text("مدت اعتبار به روز رو بفرست (فقط عدد):")
+    return ASK_EXPIRE
+
+
+async def new_user_expire(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("لطفاً فقط عدد روز بفرست.")
+        return ASK_EXPIRE
+    context.user_data["new_user"]["expire_days"] = int(text)
+    await update.message.reply_text(
+        "تعداد اتصال همزمان رو بفرست (فقط عدد، مثلاً 1 یا 3):\n"
+        "پیش‌فرض پنل معمولاً 3 است."
+    )
+    return ASK_CONCURRENT
+
+
+async def new_user_concurrent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        await update.message.reply_text("لطفاً عدد صحیح بزرگ‌تر از صفر بفرست (مثلاً 1 یا 3).")
+        return ASK_CONCURRENT
+    context.user_data["new_user"]["concurrent_connections"] = int(text)
+
+    d = context.user_data["new_user"]
+    choices = d["_inbound_choices"]
+    inbound_labels = ", ".join(choices[i] for i in d["inbound_ids"])
+    summary = (
+        f"نام کاربری: {d['username']}\n"
+        f"اینباندها: {inbound_labels}\n"
+        f"ترافیک: {d['traffic_limit_gb']} GB\n"
+        f"اعتبار: {d['expire_days']} روز\n"
+        f"اتصال همزمان: {d['concurrent_connections']}\n\n"
+        "ساخته بشه؟"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ بله", callback_data="user:create_confirm"),
+                InlineKeyboardButton("❌ انصراف", callback_data="menu:main"),
+            ]
+        ]
+    )
+    await update.message.reply_text(summary, reply_markup=kb)
+    return CONFIRM_CREATE
+
+
+async def create_user_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    d = context.user_data.get("new_user", {})
+
+    payload = {
+        "username": d["username"],
+        "inbound_ids": [int(i) if str(i).isdigit() else i for i in d["inbound_ids"]],
+        "traffic_limit_gb": d["traffic_limit_gb"],
+        "expire_days": d["expire_days"],
+        "concurrent_connections": d.get("concurrent_connections", 3),
+    }
+
+    try:
+        created = await panel.create_user(payload)
+    except PanelError as e:
+        await query.edit_message_text(f"❌ ساخت کاربر با خطا مواجه شد:\n{e.detail}")
+        return ConversationHandler.END
+
+    context.user_data.pop("new_user", None)
+    uname = created.get("username", d["username"]) if isinstance(created, dict) else d["username"]
+    await query.edit_message_text(
+        f"✅ کاربر ساخته شد: {uname}",
+        reply_markup=users_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ── create inbound conversation ─────────────────────────────────────────────
+
+
+@admin_only
+async def new_inbound_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_inbound"] = {}
+    await query.edit_message_text("نام اینباند رو بفرست:")
+    return ASK_IB_NAME
+
+
+async def new_inbound_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_inbound"]["name"] = update.message.text.strip()[:60]
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("VLESS + WS + TLS", callback_data="ibproto:vless_ws")],
+            [InlineKeyboardButton("VLESS Reality", callback_data="ibproto:reality")],
+            [InlineKeyboardButton("Worker (Cloudflare)", callback_data="ibproto:worker")],
+            [InlineKeyboardButton("❌ انصراف", callback_data="menu:inbounds")],
+        ]
+    )
+    await update.message.reply_text("پروتکل رو انتخاب کن:", reply_markup=kb)
+    return ASK_IB_PROTO
+
+
+async def new_inbound_proto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    d = context.user_data["new_inbound"]
+
+    if choice == "vless_ws":
+        payload = {
+            "name": d["name"],
+            "protocol": "vless",
+            "network": "ws",
+            "security": "tls",
+        }
+    elif choice == "reality":
+        payload = {
+            "name": d["name"],
+            "protocol": "reality",
+            "network": "tcp",
+            "security": "reality",
+        }
+    elif choice == "worker":
+        payload = {
+            "name": d["name"],
+            "protocol": "worker",
+        }
+    else:
+        await query.edit_message_text("انتخاب نامعتبر.")
+        return ConversationHandler.END
+
+    try:
+        created = await panel.create_inbound(payload)
+    except PanelError as e:
+        await query.edit_message_text(f"❌ خطا در ساخت اینباند:\n{e.detail}")
+        return ConversationHandler.END
+
+    context.user_data.pop("new_inbound", None)
+    name = created.get("name", d["name"]) if isinstance(created, dict) else d["name"]
+    await query.edit_message_text(
+        f"✅ اینباند ساخته شد: {name}",
+        reply_markup=inbounds_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ── create group conversation ───────────────────────────────────────────────
+
+
+@admin_only
+async def new_group_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("نام گروه رو بفرست:")
+    return ASK_GRP_NAME
+
+
+async def new_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()[:60]
+    try:
+        created = await panel.create_group({"name": name})
+    except PanelError as e:
+        await update.message.reply_text(f"❌ خطا:\n{e.detail}")
+        return ConversationHandler.END
+    gname = created.get("name", name) if isinstance(created, dict) else name
+    await update.message.reply_text(
+        f"✅ گروه ساخته شد: {gname}",
+        reply_markup=groups_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ── edit user fields (name / traffic / expire) ───────────────────────────────
+
+
+@admin_only
+async def edit_name_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.data.split(":", 2)[2]
+    context.user_data["edit_user_id"] = user_id
+    await query.edit_message_text("نام کاربری جدید رو بفرست:")
+    return EDIT_USERNAME
+
+
+async def edit_name_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.user_data.get("edit_user_id")
+    new_name = update.message.text.strip()[:40]
+    if not new_name:
+        await update.message.reply_text("نام خالی نباشه. دوباره بفرست:")
+        return EDIT_USERNAME
+    try:
+        await panel.update_user(user_id, {"username": new_name})
+    except PanelError as e:
+        await update.message.reply_text(f"❌ خطا:\n{e.detail}")
+        return ConversationHandler.END
+    context.user_data.pop("edit_user_id", None)
+    await update.message.reply_text(
+        f"✅ نام کاربری به <b>{html.escape(new_name)}</b> تغییر کرد.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=user_detail_keyboard(user_id),
+    )
+    return ConversationHandler.END
+
+
+@admin_only
+async def edit_traffic_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.data.split(":", 2)[2]
+    context.user_data["edit_user_id"] = user_id
+    await query.edit_message_text(
+        "سقف ترافیک جدید به گیگابایت رو بفرست (فقط عدد):\n"
+        "مثال: <code>50</code> یا <code>0</code> برای نامحدود",
+        parse_mode=ParseMode.HTML,
+    )
+    return EDIT_TRAFFIC
+
+
+async def edit_traffic_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.user_data.get("edit_user_id")
+    text = update.message.text.strip()
+    if not text.replace(".", "", 1).isdigit():
+        await update.message.reply_text("لطفاً فقط عدد بفرست (مثلاً 30 یا 0).")
+        return EDIT_TRAFFIC
+    gb = float(text)
+    try:
+        await panel.update_user(user_id, {"traffic_limit_gb": gb})
+    except PanelError as e:
+        await update.message.reply_text(f"❌ خطا:\n{e.detail}")
+        return ConversationHandler.END
+    context.user_data.pop("edit_user_id", None)
+    label = "نامحدود" if gb <= 0 else f"{gb} GB"
+    await update.message.reply_text(
+        f"✅ سقف ترافیک به <b>{label}</b> تغییر کرد.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=user_detail_keyboard(user_id),
+    )
+    return ConversationHandler.END
+
+
+@admin_only
+async def edit_expire_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.data.split(":", 2)[2]
+    context.user_data["edit_user_id"] = user_id
+    await query.edit_message_text(
+        "مدت اعتبار جدید به <b>روز</b> رو بفرست (فقط عدد):\n"
+        "از الان محاسبه می‌شه.\n"
+        "مثال: <code>30</code> یا <code>0</code> برای بدون انقضا",
+        parse_mode=ParseMode.HTML,
+    )
+    return EDIT_EXPIRE
+
+
+async def edit_expire_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.user_data.get("edit_user_id")
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("لطفاً فقط عدد روز بفرست (مثلاً 30 یا 0).")
+        return EDIT_EXPIRE
+    days = int(text)
+    try:
+        await panel.update_user(user_id, {"expire_days": days})
+    except PanelError as e:
+        await update.message.reply_text(f"❌ خطا:\n{e.detail}")
+        return ConversationHandler.END
+    context.user_data.pop("edit_user_id", None)
+    label = "بدون انقضا" if days <= 0 else f"{days} روز (از الان)"
+    await update.message.reply_text(
+        f"✅ اعتبار به <b>{label}</b> تغییر کرد.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=user_detail_keyboard(user_id),
+    )
+    return ConversationHandler.END
+
+
+@admin_only
+async def edit_concurrent_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.data.split(":", 2)[2]
+    context.user_data["edit_user_id"] = user_id
+    await query.edit_message_text(
+        "تعداد اتصال همزمان جدید رو بفرست (فقط عدد):\n"
+        "مثال: <code>1</code> یا <code>3</code>",
+        parse_mode=ParseMode.HTML,
+    )
+    return EDIT_CONCURRENT
+
+
+async def edit_concurrent_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.user_data.get("edit_user_id")
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        await update.message.reply_text("لطفاً عدد صحیح بزرگ‌تر از صفر بفرست (مثلاً 1 یا 3).")
+        return EDIT_CONCURRENT
+    n = int(text)
+    try:
+        await panel.update_user(user_id, {"concurrent_connections": n})
+    except PanelError as e:
+        await update.message.reply_text(f"❌ خطا:\n{e.detail}")
+        return ConversationHandler.END
+    context.user_data.pop("edit_user_id", None)
+    await update.message.reply_text(
+        f"✅ تعداد اتصال همزمان به <b>{n}</b> تغییر کرد.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=user_detail_keyboard(user_id),
+    )
+    return ConversationHandler.END
+
+
+# ── change password conversation ────────────────────────────────────────────
+
+
+@admin_only
+async def change_pass_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("پسورد فعلی پنل رو بفرست:")
+    return ASK_OLD_PASS
+
+
+async def change_pass_old(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["old_pass"] = update.message.text.strip()
+    await update.message.reply_text("پسورد جدید رو بفرست:")
+    return ASK_NEW_PASS
+
+
+async def change_pass_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    old = context.user_data.get("old_pass", "")
+    new = update.message.text.strip()
+    if len(new) < 4:
+        await update.message.reply_text("پسورد جدید خیلی کوتاهه. دوباره بفرست:")
+        return ASK_NEW_PASS
+    try:
+        await panel.change_password(old, new)
+    except PanelError as e:
+        await update.message.reply_text(f"❌ خطا:\n{e.detail}")
+        return ConversationHandler.END
+    # update local client password so future requests work
+    panel.admin_password = new
+    context.user_data.pop("old_pass", None)
+    await update.message.reply_text(
+        "✅ پسورد پنل تغییر کرد.\nیادت نره مقدار PANEL_ADMIN_PASSWORD رو هم توی .env آپدیت کنی.",
+        reply_markup=main_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    if update.message:
+        await update.message.reply_text("لغو شد.", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+
+# ── app wiring ──────────────────────────────────────────────────────────────
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ خطای غیرمنتظره:\n<code>{html.escape(str(context.error))}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:
+        pass
+
+
+def build_app() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+
+    # create user
+    conv_user = ConversationHandler(
+        entry_points=[CallbackQueryHandler(new_user_entry, pattern="^user:new$")],
+        states={
+            ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_user_username)],
+            ASK_INBOUNDS: [
+                CallbackQueryHandler(toggle_inbound, pattern="^inbound_toggle:"),
+                CallbackQueryHandler(inbound_done, pattern="^inbound_done$"),
+            ],
+            ASK_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_user_limit)],
+            ASK_EXPIRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_user_expire)],
+            ASK_CONCURRENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, new_user_concurrent)
+            ],
+            CONFIRM_CREATE: [
+                CallbackQueryHandler(create_user_confirmed, pattern="^user:create_confirm$")
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_user)
+
+    # create inbound
+    conv_ib = ConversationHandler(
+        entry_points=[CallbackQueryHandler(new_inbound_entry, pattern="^inbound:new$")],
+        states={
+            ASK_IB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_inbound_name)],
+            ASK_IB_PROTO: [CallbackQueryHandler(new_inbound_proto, pattern="^ibproto:")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_ib)
+
+    # create group
+    conv_grp = ConversationHandler(
+        entry_points=[CallbackQueryHandler(new_group_entry, pattern="^group:new$")],
+        states={
+            ASK_GRP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_group_name)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_grp)
+
+    # edit username
+    conv_edit_name = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(edit_name_entry, pattern=r"^user:edit_name:")
+        ],
+        states={
+            EDIT_USERNAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name_receive)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_edit_name)
+
+    # edit traffic limit
+    conv_edit_traffic = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(edit_traffic_entry, pattern=r"^user:edit_traffic:")
+        ],
+        states={
+            EDIT_TRAFFIC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_traffic_receive)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_edit_traffic)
+
+    # edit expire days
+    conv_edit_expire = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(edit_expire_entry, pattern=r"^user:edit_expire:")
+        ],
+        states={
+            EDIT_EXPIRE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_expire_receive)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_edit_expire)
+
+    # edit concurrent connections
+    conv_edit_concurrent = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(edit_concurrent_entry, pattern=r"^user:edit_concurrent:")
+        ],
+        states={
+            EDIT_CONCURRENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_concurrent_receive)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_edit_concurrent)
+
+    # change password
+    conv_pass = ConversationHandler(
+        entry_points=[CallbackQueryHandler(change_pass_entry, pattern="^settings:pass$")],
+        states={
+            ASK_OLD_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_pass_old)],
+            ASK_NEW_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_pass_new)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_pass)
+
+    # general callbacks (must be after conversations)
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(on_error)
+
+    return app
+
+
+def main():
+    app = build_app()
+    logger.info("Spider Panel Bot starting (expanded)...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()

@@ -32,7 +32,7 @@ from telegram.ext import (
     filters,
 )
 
-from panel_client import PanelClient, PanelError
+from panel_client import PanelClient, PanelError, obj_id, obj_label
 
 load_dotenv()
 
@@ -121,15 +121,13 @@ async def render_user_list(query, page: int):
     start = page * PAGE_SIZE
     chunk = users[start : start + PAGE_SIZE]
 
-    buttons = [
-        [
-            InlineKeyboardButton(
-                f"{u.get('username', u.get('id'))}",
-                callback_data=f"user:view:{u.get('id')}",
-            )
-        ]
-        for u in chunk
-    ]
+    buttons = []
+    for u in chunk:
+        uid = obj_id(u, "id", "user_id", "_id", "uuid", "username")
+        label = obj_label(u, "username", "name", "id", default=str(uid))
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=f"user:view:{uid}")]
+        )
 
     nav = []
     if page > 0:
@@ -164,6 +162,11 @@ async def render_user_detail(query, user_id):
     except PanelError as e:
         await query.edit_message_text(f"خطا:\n{e.detail}")
         return
+
+    if isinstance(u, dict) and isinstance(u.get("user"), dict):
+        u = u["user"]  # some panels wrap the object under a "user" key
+    if not isinstance(u, dict):
+        u = {}
 
     lines = [f"👤 <b>{u.get('username', user_id)}</b>"]
     for key in ("expire", "limit_bytes", "traffic_limit_gb", "proxy_ip_enabled", "proxy_country"):
@@ -278,9 +281,12 @@ async def new_user_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("هیچ اینباندی توی پنل تعریف نشده. اول از پنل یه اینباند بساز.")
         return ConversationHandler.END
 
-    context.user_data["new_user"]["_inbound_choices"] = {
-        str(ib.get("id")): ib.get("remark", ib.get("id")) for ib in inbounds
-    }
+    choices = {}
+    for ib in inbounds:
+        ib_id = obj_id(ib, "id", "inbound_id", "_id", "tag", "remark")
+        label = obj_label(ib, "remark", "name", "tag", "id", default=str(ib_id))
+        choices[str(ib_id)] = label
+    context.user_data["new_user"]["_inbound_choices"] = choices
     context.user_data["new_user"]["inbound_ids"] = []
 
     await update.message.reply_text(
@@ -402,6 +408,19 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ---------------------------------------------------------------------
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ یه خطای غیرمنتظره پیش اومد:\n<code>{context.error}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:
+        pass
+
+
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -426,6 +445,7 @@ def build_app() -> Application:
     # general callback router (list/view/config/qr/delete/menu) — must be
     # added after the conversation handler so it doesn't swallow its callbacks
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(on_error)
 
     return app
 

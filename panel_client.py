@@ -26,6 +26,45 @@ class PanelError(Exception):
         super().__init__(f"Panel API error {status_code}: {detail}")
 
 
+def normalize_list(data) -> list:
+    """
+    Different panel forks return list endpoints in different shapes:
+    a plain JSON array, a dict wrapping the array under a key like
+    "users"/"items"/"data"/"results", or even a dict keyed by id
+    (id -> object). This normalizes all of those into a plain list.
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("users", "inbounds", "items", "data", "results", "list"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        # fall back: dict keyed by id -> treat values as the list
+        return list(data.values())
+    return []
+
+
+def obj_id(obj, *keys):
+    """Get an id from an item that may be a dict or a bare string/int."""
+    if isinstance(obj, dict):
+        for k in keys:
+            if k in obj and obj[k] is not None:
+                return obj[k]
+        return None
+    return obj
+
+
+def obj_label(obj, *keys, default=None):
+    """Get a display label from an item that may be a dict or a bare value."""
+    if isinstance(obj, dict):
+        for k in keys:
+            if k in obj and obj[k] not in (None, ""):
+                return str(obj[k])
+        return default if default is not None else str(obj)
+    return str(obj)
+
+
 class PanelClient:
     def __init__(self, base_url: str, admin_password: str, timeout: float = 20.0):
         self.base_url = base_url.rstrip("/")
@@ -62,9 +101,9 @@ class PanelClient:
 
     # ---- users ------------------------------------------------------
 
-    async def list_users(self) -> list[dict]:
+    async def list_users(self) -> list:
         r = await self._request("GET", "/api/users")
-        return r.json()
+        return normalize_list(r.json())
 
     async def get_user(self, user_id) -> dict:
         r = await self._request("GET", f"/api/users/{user_id}")
@@ -95,9 +134,9 @@ class PanelClient:
 
     # ---- inbounds -----------------------------------------------------
 
-    async def list_inbounds(self) -> list[dict]:
+    async def list_inbounds(self) -> list:
         r = await self._request("GET", "/api/inbounds")
-        return r.json()
+        return normalize_list(r.json())
 
     # ---- misc -----------------------------------------------------
 

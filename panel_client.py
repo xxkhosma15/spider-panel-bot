@@ -1,15 +1,14 @@
 """
 Thin async client for the Spider Panel API.
 
-The panel authenticates via a session cookie: POST /api/login with the
-admin password, then the cookie is sent on every subsequent request.
-This client logs in lazily and re-logs-in automatically if a request
-comes back 401 (e.g. because the session expired).
-
-Endpoints used here are the ones documented in the panel's README. If
-your fork of the panel uses slightly different field names for
-creating/updating a user, adjust the payload you pass into
-create_user() / update_user() — the client itself just forwards it.
+Covers the main documented endpoints:
+  - Auth (login / change password)
+  - Users (CRUD, toggle, reset traffic, config, QR, sub)
+  - Inbounds (list, create, update, delete, generate keys)
+  - Groups
+  - Scanner (saved IPs)
+  - Cloudflare Worker
+  - Server stats
 """
 
 from __future__ import annotations
@@ -18,8 +17,6 @@ import httpx
 
 
 class PanelError(Exception):
-    """Raised when the panel API returns an error response."""
-
     def __init__(self, status_code: int, detail: str):
         self.status_code = status_code
         self.detail = detail
@@ -27,26 +24,18 @@ class PanelError(Exception):
 
 
 def normalize_list(data) -> list:
-    """
-    Different panel forks return list endpoints in different shapes:
-    a plain JSON array, a dict wrapping the array under a key like
-    "users"/"items"/"data"/"results", or even a dict keyed by id
-    (id -> object). This normalizes all of those into a plain list.
-    """
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        for key in ("users", "inbounds", "items", "data", "results", "list"):
+        for key in ("users", "inbounds", "groups", "items", "data", "results", "list"):
             value = data.get(key)
             if isinstance(value, list):
                 return value
-        # fall back: dict keyed by id -> treat values as the list
         return list(data.values())
     return []
 
 
 def obj_id(obj, *keys):
-    """Get an id from an item that may be a dict or a bare string/int."""
     if isinstance(obj, dict):
         for k in keys:
             if k in obj and obj[k] is not None:
@@ -56,7 +45,6 @@ def obj_id(obj, *keys):
 
 
 def obj_label(obj, *keys, default=None):
-    """Get a display label from an item that may be a dict or a bare value."""
     if isinstance(obj, dict):
         for k in keys:
             if k in obj and obj[k] not in (None, ""):
@@ -69,16 +57,6 @@ _CONFIG_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "ssr://")
 
 
 def extract_config_uris(obj) -> list[str]:
-    """
-    Recursively walk any JSON-decoded structure (dict/list/str) and
-    collect every string that looks like a proxy config URI
-    (vless://, vmess://, trojan://, ss://...). This makes config
-    extraction robust to whatever shape a given panel fork wraps its
-    configs in (a "configs" list, a "custom_configs" list, a nested
-    "status" object, etc.) — we don't need to know the exact schema,
-    just recognize the URIs themselves. Order is preserved and
-    duplicates are dropped.
-    """
     found: list[str] = []
 
     def walk(node):
@@ -93,7 +71,6 @@ def extract_config_uris(obj) -> list[str]:
                 walk(v)
 
     walk(obj)
-
     seen = set()
     unique = []
     for uri in found:
@@ -104,7 +81,7 @@ def extract_config_uris(obj) -> list[str]:
 
 
 class PanelClient:
-    def __init__(self, base_url: str, admin_password: str, timeout: float = 20.0):
+    def __init__(self, base_url: str, admin_password: str, timeout: float = 25.0):
         self.base_url = base_url.rstrip("/")
         self.admin_password = admin_password
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
@@ -116,28 +93,31 @@ class PanelClient:
     # ---- auth -----------------------------------------------------
 
     async def login(self):
-        r = await self._client.post(
-            "/api/login", json={"password": self.admin_password}
-        )
+        r = await self._client.post("/api/login", json={"password": self.admin_password})
         if r.status_code >= 400:
             raise PanelError(r.status_code, r.text)
         self._logged_in = True
 
+    async def change_password(self, current: str, new: str) -> dict:
+        r = await self._request(
+            "POST",
+            "/api/change-password",
+            json={"current_password": current, "new_password": new},
+        )
+        return r.json()
+
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         if not self._logged_in:
             await self.login()
-
         r = await self._client.request(method, path, **kwargs)
         if r.status_code == 401:
-            # session expired -> log in again and retry once
             await self.login()
             r = await self._client.request(method, path, **kwargs)
-
         if r.status_code >= 400:
             raise PanelError(r.status_code, r.text)
         return r
 
-    # ---- users ------------------------------------------------------
+    # ---- users ----------------------------------------------------
 
     async def list_users(self) -> list:
         r = await self._request("GET", "/api/users")
@@ -155,6 +135,14 @@ class PanelClient:
         r = await self._request("PATCH", f"/api/users/{user_id}", json=payload)
         return r.json()
 
+    async def toggle_user(self, user_id) -> dict:
+        r = await self._request("PATCH", f"/api/users/{user_id}/toggle")
+        return r.json()
+
+    async def reset_user_traffic(self, user_id) -> dict:
+        r = await self._request("PATCH", f"/api/users/{user_id}/reset")
+        return r.json()
+
     async def delete_user(self, user_id) -> None:
         await self._request("DELETE", f"/api/users/{user_id}")
 
@@ -167,26 +155,87 @@ class PanelClient:
         return r.content
 
     async def get_sub_data(self, identifier: str) -> dict:
-        """
-        GET /api/sub/{username} — the panel's own data source for the
-        per-user subscription page. Returns everything needed to build
-        the sub page: main configs, custom-IP configs, status config,
-        etc. This is the endpoint to use to get *all* of a user's
-        configs (a single /api/users/{id}/config call only returns one).
-        """
         r = await self._request("GET", f"/api/sub/{identifier}")
         return r.json()
 
     def sub_page_url(self, identifier: str) -> str:
         return f"{self.base_url}/sub/{identifier}"
 
-    # ---- inbounds -----------------------------------------------------
+    # ---- inbounds -------------------------------------------------
 
     async def list_inbounds(self) -> list:
         r = await self._request("GET", "/api/inbounds")
         return normalize_list(r.json())
 
-    # ---- misc -----------------------------------------------------
+    async def create_inbound(self, payload: dict) -> dict:
+        r = await self._request("POST", "/api/inbounds", json=payload)
+        return r.json()
+
+    async def update_inbound(self, inbound_id, payload: dict) -> dict:
+        r = await self._request("PATCH", f"/api/inbounds/{inbound_id}", json=payload)
+        return r.json()
+
+    async def delete_inbound(self, inbound_id) -> None:
+        await self._request("DELETE", f"/api/inbounds/{inbound_id}")
+
+    async def generate_reality_keys(self, inbound_id) -> dict:
+        r = await self._request("POST", f"/api/inbounds/{inbound_id}/generate-reality-keys")
+        return r.json()
+
+    async def generate_short_id(self, inbound_id) -> dict:
+        r = await self._request("POST", f"/api/inbounds/{inbound_id}/generate-short-id")
+        return r.json()
+
+    # ---- groups ---------------------------------------------------
+
+    async def list_groups(self) -> list:
+        r = await self._request("GET", "/api/groups")
+        return normalize_list(r.json())
+
+    async def create_group(self, payload: dict) -> dict:
+        r = await self._request("POST", "/api/groups", json=payload)
+        return r.json()
+
+    async def update_group(self, group_id, payload: dict) -> dict:
+        r = await self._request("PATCH", f"/api/groups/{group_id}", json=payload)
+        return r.json()
+
+    async def delete_group(self, group_id) -> None:
+        await self._request("DELETE", f"/api/groups/{group_id}")
+
+    # ---- scanner --------------------------------------------------
+
+    async def scanner_ips(self, ctype: str) -> dict:
+        r = await self._request("GET", f"/api/scanner/ips/{ctype}")
+        return r.json()
+
+    async def scanner_resolve(self, host: str) -> dict:
+        r = await self._request("GET", "/api/scanner/resolve", params={"host": host})
+        return r.json()
+
+    # ---- worker ---------------------------------------------------
+
+    async def worker_status(self) -> dict:
+        r = await self._request("GET", "/api/worker")
+        return r.json()
+
+    async def worker_sync(self) -> dict:
+        r = await self._request("POST", "/api/worker/sync")
+        return r.json()
+
+    async def worker_sync_source(self) -> dict:
+        r = await self._request("POST", "/api/worker/sync-source")
+        return r.json()
+
+    async def worker_locations(self) -> dict:
+        r = await self._request("GET", "/api/worker/locations")
+        return r.json()
+
+    async def worker_disconnect(self) -> dict:
+        r = await self._request("DELETE", "/api/worker")
+        return r.json()
+
+    # ---- server ---------------------------------------------------
 
     async def server_stats(self) -> dict:
         r = await self._request("GET", "/api/server/stats")
